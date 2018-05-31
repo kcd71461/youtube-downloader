@@ -1,7 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net;
 using Newtonsoft.Json;
 using YoutubeExtractor;
 
@@ -9,15 +11,15 @@ namespace YouTubeDownloader
 {
     class Program
     {
-        private const string SETTING_FILENAME = "test.json";
-
+        private static readonly string captionXmlUrlFormat =
+            "https://www.youtube.com/api/timedtext?asr_langs=en&v={0}&xorp=True&key=yttt1&caps=asr&lang=en&fmt=srv3";
         static void Main(string[] args)
         {
             var youtubeApi = new YouTubeApi();
             youtubeApi.Authorize().Wait();
 
             var settingFileName = args != null & args.Length > 0 ? args[0] : getSettingFileName();
-            var jsonText = File.ReadAllText(SETTING_FILENAME);
+            var jsonText = File.ReadAllText(settingFileName);
             var setting = JsonConvert.DeserializeObject<DownloadSetting>(jsonText);
             IEnumerable<string> videoIds = null;
 
@@ -40,11 +42,28 @@ namespace YouTubeDownloader
                 {
                     var fileName =
                         Path.Combine(
-                            String.IsNullOrEmpty(setting.OutputDirectory)
+                            string.IsNullOrEmpty(setting.OutputDirectory)
                                 ? Directory.GetCurrentDirectory()
-                                : setting.OutputDirectory, videoId);
+                                : setting.OutputDirectory,
+                            videoId);
                     DownloadWithVideoId(videoId, fileName);
-                    youtubeApi.GetCaption(videoId);
+                    using (var wc = new WebClient())
+                    {
+                        var response = wc.DownloadString(string.Format(captionXmlUrlFormat, videoId));
+                        if (string.IsNullOrWhiteSpace(response))
+                        {
+                            response = wc.DownloadString(string.Format(captionXmlUrlFormat, videoId) + "&name=English");
+                        }
+                        
+                        if (string.IsNullOrWhiteSpace(response))
+                        {
+                            Console.WriteLine($"{videoId} caption not found");
+                        }
+                        else
+                        {
+                            File.WriteAllText(videoId + ".xml", response);
+                        }
+                    }
                 }
             }
         }
