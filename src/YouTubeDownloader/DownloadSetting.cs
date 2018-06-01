@@ -22,5 +22,11 @@ namespace YouTubeDownloader
         public string Query { get; set; }
         [JsonProperty("output_directory")]
         public string OutputDirectory { get; set; }
+        [JsonProperty("ffmpeg_path")]
+        public string FFMpegPath { get; set; }
+
+        [JsonProperty("extract_audio")]
+        public bool ExtractAudio { get; set; } = false;
+
     }
 }

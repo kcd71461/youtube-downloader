@@ -1,9 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
+using Frapper;
 using Newtonsoft.Json;
 using YoutubeExtractor;
 
@@ -11,8 +11,18 @@ namespace YouTubeDownloader
 {
     class Program
     {
+        private static string ffmpegPath = @"c:\ffmpeg\bin\ffmpeg.exe";
+
         private static readonly string captionXmlUrlFormat =
-            "https://www.youtube.com/api/timedtext?asr_langs=en&v={0}&xorp=True&key=yttt1&caps=asr&lang=en&fmt=srv3";
+            "https://www.youtube.com/api/timedtext?" +
+            "asr_langs=en&" +
+            "v={0}&" +
+            "xorp=True&" +
+            "key=yttt1&" +
+            "caps=asr&" +
+            "lang=en&" +
+            "fmt=srv3";
+
         static void Main(string[] args)
         {
             var youtubeApi = new YouTubeApi();
@@ -21,48 +31,52 @@ namespace YouTubeDownloader
             var settingFileName = args != null & args.Length > 0 ? args[0] : getSettingFileName();
             var jsonText = File.ReadAllText(settingFileName);
             var setting = JsonConvert.DeserializeObject<DownloadSetting>(jsonText);
+            var downloadDirectory = string.IsNullOrEmpty(setting.OutputDirectory)
+                ? Directory.GetCurrentDirectory()
+                : setting.OutputDirectory;
+            if (!string.IsNullOrWhiteSpace(setting.FFMpegPath))
+            {
+                ffmpegPath = setting.FFMpegPath;
+            }
+
+
             IEnumerable<string> videoIds = null;
 
             switch (setting.ListFetchType)
             {
                 case DownloadSetting.ListFetchTypes.search:
-                    videoIds = youtubeApi.SearchVideos(setting.Query, setting.ChannelId).Select(item=>item.Id.VideoId);
+                    videoIds = youtubeApi.SearchVideos(setting.Query, setting.ChannelId).Select(item => item.Id.VideoId);
                     Console.WriteLine($"search result count: {videoIds.Count()}");
                     break;
+                default:
+                    throw new ArgumentOutOfRangeException();
             }
 
-            if (!string.IsNullOrEmpty(setting.OutputDirectory)&& !Directory.Exists(setting.OutputDirectory))
+            if (!string.IsNullOrEmpty(setting.OutputDirectory) && !Directory.Exists(setting.OutputDirectory))
             {
                 Directory.CreateDirectory(setting.OutputDirectory);
             }
 
-            if (videoIds != null)
+            foreach (var videoId in videoIds)
             {
-                foreach (var videoId in videoIds)
+                var fileName =
+                    Path.Combine(downloadDirectory, videoId);
+                DownloadWithVideoId(videoId, fileName, setting.ExtractAudio);
+                using (var wc = new WebClient())
                 {
-                    var fileName =
-                        Path.Combine(
-                            string.IsNullOrEmpty(setting.OutputDirectory)
-                                ? Directory.GetCurrentDirectory()
-                                : setting.OutputDirectory,
-                            videoId);
-                    DownloadWithVideoId(videoId, fileName);
-                    using (var wc = new WebClient())
+                    var response = wc.DownloadString(string.Format(captionXmlUrlFormat, videoId));
+                    if (string.IsNullOrWhiteSpace(response))
                     {
-                        var response = wc.DownloadString(string.Format(captionXmlUrlFormat, videoId));
-                        if (string.IsNullOrWhiteSpace(response))
-                        {
-                            response = wc.DownloadString(string.Format(captionXmlUrlFormat, videoId) + "&name=English");
-                        }
-                        
-                        if (string.IsNullOrWhiteSpace(response))
-                        {
-                            Console.WriteLine($"{videoId} caption not found");
-                        }
-                        else
-                        {
-                            File.WriteAllText(videoId + ".xml", response);
-                        }
+                        response = wc.DownloadString(string.Format(captionXmlUrlFormat, videoId) + "&name=English");
+                    }
+
+                    if (string.IsNullOrWhiteSpace(response))
+                    {
+                        Console.WriteLine($"{videoId} caption not found");
+                    }
+                    else
+                    {
+                        File.WriteAllText(Path.Combine(downloadDirectory, videoId + ".xml"), response);
                     }
                 }
             }
@@ -74,32 +88,54 @@ namespace YouTubeDownloader
             return Console.ReadLine();
         }
 
-        static void DownloadWithUrl(string url, string outputFileName = null)
+        static bool DownloadWithUrl(string url, string outputFileName = null, bool extractAudio = false)
         {
 
-            IEnumerable<VideoInfo> videoInfos = DownloadUrlResolver.GetDownloadUrls(url);
-            // LogVideoInfos(videoInfos);
+            IEnumerable<VideoInfo> videoInfos=null;
+            try
+            {
+                videoInfos= DownloadUrlResolver.GetDownloadUrls(url);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"Failed to get {url}");
+                return false;
+            }
+            
             var audioExtractables = videoInfos.Where(info => info.CanExtractAudio);
-            var wavConvertNeeded = !audioExtractables.Any();
+            var audioTrackExists = false;
             VideoInfo videoInfo = null;
 
-            if (wavConvertNeeded) //TODO: audio extractable이 없으면 영상 다운로드 후 wav 변환
+            if (extractAudio && audioExtractables.Any())
             {
-                var mp4Videos = videoInfos.Where(info => info.VideoType == VideoType.Mp4)
-                    .OrderByDescending(info => info.AudioBitrate);
+                videoInfo = audioExtractables.OrderByDescending(info => info.AudioBitrate).First();
+                audioTrackExists = true;
+            }
+            else
+            {
+                IEnumerable<VideoInfo> mp4Videos = videoInfos;
+                if (extractAudio)
+                {
+                    mp4Videos = videoInfos.Where(info => info.VideoType == VideoType.Mp4)
+                        .OrderByDescending(info => info.AudioBitrate);
+                }
+                else
+                {
+                    mp4Videos = videoInfos.Where(info => info.VideoType == VideoType.Mp4 && info.AudioBitrate > 0)
+                        .OrderByDescending(info => info.AudioBitrate)
+                        .OrderByDescending(info => info.Resolution);
+                    LogVideoInfos(mp4Videos);
+
+                }
                 if (mp4Videos.Any())
                 {
                     videoInfo = mp4Videos.First();
                 }
             }
-            else
-            {
-                videoInfo = audioExtractables.OrderByDescending(info => info.AudioBitrate).First();
-            }
 
             if (videoInfo == null)
             {
-                return;
+                return false;
             }
 
             if (videoInfo.RequiresDecryption)
@@ -111,28 +147,50 @@ namespace YouTubeDownloader
             if (string.IsNullOrEmpty(outputFileName))
                 outputFileName = videoInfo.Title;
 
-            if (wavConvertNeeded)
+            if (!audioTrackExists || !extractAudio)
             {
-                var fileName = outputFileName + videoInfo.VideoExtension;
+                var videoFileName = outputFileName + videoInfo.VideoExtension;
+                try
+                {
+                    var videoDownloader = new VideoDownloader(videoInfo, Path.Combine("", videoFileName));
+                    // videoDownloader.DownloadProgressChanged += (sender, e) => Console.WriteLine(e.ProgressPercentage);
+                    videoDownloader.Execute();
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine($"{videoFileName} Download Failed");
+                    return false;
+                }
 
-                var videoDownloader = new VideoDownloader(videoInfo, Path.Combine("", fileName));
-                // videoDownloader.DownloadProgressChanged += (sender, e) => Console.WriteLine(e.ProgressPercentage);
-                videoDownloader.Execute();
+                if (extractAudio)
+                {
+                    var ffmpeg = new FFMPEG(ffmpegPath);
+                    ffmpeg.RunCommand($"-i \"{videoFileName}\" \"{outputFileName + ".wav"}\"");
+                    // File.Delete(videoFileName);
+                }
             }
             else
             {
                 var fileName = outputFileName + videoInfo.AudioExtension;
-
-                var audioDownloader = new AudioDownloader(videoInfo, fileName);
-                // audioDownloader.DownloadProgressChanged += (sender, e) => Console.WriteLine(e.ProgressPercentage * 0.85);
-                // audioDownloader.AudioExtractionProgressChanged += (sender, e) => Console.WriteLine(85 + e.ProgressPercentage * 0.15);
-                audioDownloader.Execute();
+                try
+                {
+                    var audioDownloader = new AudioDownloader(videoInfo, fileName);
+                    // audioDownloader.DownloadProgressChanged += (sender, e) => Console.WriteLine(e.ProgressPercentage * 0.85);
+                    // audioDownloader.AudioExtractionProgressChanged += (sender, e) => Console.WriteLine(85 + e.ProgressPercentage * 0.15);
+                    audioDownloader.Execute();
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine($"{fileName} Download Failed");
+                    return false;
+                }
             }
+            return true;
         }
 
-        static void DownloadWithVideoId(string videoId, string outputFileName = null)
+        static void DownloadWithVideoId(string videoId, string outputFileName = null, bool extractAudio = false)
         {
-            DownloadWithUrl($"https://www.youtube.com/watch?v={videoId}", outputFileName);
+            DownloadWithUrl($"https://www.youtube.com/watch?v={videoId}", outputFileName, extractAudio);
         }
 
         private static string ReplaceInvalideFileCharactor(string fileName)
